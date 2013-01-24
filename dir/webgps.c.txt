@@ -1,0 +1,451 @@
+/* Makes a simple HTML and SVG layout for GPSD */
+/* (C)2007 Jason Hecker v0.03*/
+/* This is a severely mangled version of xgps.c */
+/* To use call: webgps [server] [port] [path] [period] */
+/* server: the gpsd server you are connecting to */
+/* port: the port number of the gpsd server */
+/* path: the destination path for gpsd.svg/html */
+/* period: time period in seconds for webgps to update */
+
+#include <stdio.h>
+#include <math.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+
+/* v2.33 */
+#include "config.h"
+/* v2.34+ */
+//#include "gpsd_config.h"
+
+#include "gps.h"
+
+#define TRACKMAX 1024
+#define SATMAX 20
+#define STALECOUNT 3
+
+typedef struct trackloc_s{
+    int x;
+    int y;
+} trackloc_t;
+
+typedef struct trackloc_head_s{
+    int PRN;
+    int count;
+    int stale;
+    trackloc_t posn[TRACKMAX];
+} trackloc_head_t;
+
+trackloc_head_t sattrack[SATMAX];
+
+static enum deg_str_type deg_type = deg_dd;
+
+static struct gps_data_t *gpsdata;
+
+static time_t timer;	/* time of last state change */
+static int state = 0;	/* or MODE_NO_FIX=1, MODE_2D=2, MODE_3D=3 */
+
+void do_html(FILE *fh);
+void do_svg(FILE *fs);
+
+void polartocart(int *x, int *y, int el, int az){
+
+#define DEG2RAD PI/180.0
+#define DIAMETER 200
+#define XYOFFSET 10
+
+    float radius, theta;
+
+    radius = DIAMETER * cos(((float)(el)) * DEG2RAD); 
+    theta = ((float)(az - 90) * DEG2RAD);
+    *x = (int)(radius * cos(theta) + 0.5) + DIAMETER + XYOFFSET;
+    *y = (int)(radius * sin(theta) + 0.5) + DIAMETER + XYOFFSET;
+
+}
+
+void do_html(FILE *fh){
+    
+    int i, newstate;
+    char s[128], *latlon; 
+    
+    const char pageheader[] = "<html xmlns=\"http://www.w3.org/1999/xhtml\">\n" \
+                              "\t<head>\n\t<title>GPSD Satellite Positions and Readings</title>\n\t</head>\n<body>\n" \
+                              "<table border=\"1\">\n\t<td>\n\t\t<table border=\"0\">\n"
+                              "\t\t\t<tr>\n\t\t\t\t<td><b>PRN:</b></td><td><b>Elev:</b></td><td><b>Azim:</b></td>"
+                              "<td><b>SNR:</b></td><td><b>Used:</b></td>\n\t\t\t</tr>\n";
+    
+    const char rowhead[] = "\t\t\t<tr>\n\t\t\t\t<td><b>%s</b></d><td>%s</td>\n\t\t\t</tr>\n";
+    
+    fprintf(fh,pageheader);
+    
+    if (gpsdata->satellites) {
+        for (i = 0; i < MAXCHANNELS; i++) {
+            if (i < (unsigned int)gpsdata->satellites) {
+                fprintf(fh,"\t\t\t<tr>\n\t\t\t\t<td>%3d</td><td>%2d</td><td>%3d</td><td>%2d</td><td>%c</td>\n\t\t\t</tr>\n",
+                        gpsdata->PRN[i],
+                        gpsdata->elevation[i], gpsdata->azimuth[i], 
+                        gpsdata->ss[i],	gpsdata->used[i] ? 'Y' : 'N');
+            }
+        }
+    }
+    
+    fprintf(fh,"\t\t</table>\n");
+
+    fprintf(fh,"\t\t<table border=\"0\">\n");
+    
+    if (isnan(gpsdata->fix.time)==0) {
+        (void)unix_to_iso8601(gpsdata->fix.time, s, (int)sizeof(s));
+    } else
+        (void)strcpy(s,"n/a");
+    fprintf(fh,rowhead,"Time:",s);
+    
+    if (gpsdata->fix.mode >= MODE_2D) {
+        latlon = deg_to_str(deg_type,  fabs(gpsdata->fix.latitude));
+        (void)snprintf(s, sizeof(s), "%s %c", latlon, (gpsdata->fix.latitude < 0) ? 'S' : 'N');
+    } else
+        (void)strcpy(s, "n/a");
+    fprintf(fh,rowhead,"Latitude:",s);
+    
+    if (gpsdata->fix.mode >= MODE_2D) {
+        latlon = deg_to_str(deg_type,  fabs(gpsdata->fix.longitude));
+        (void)snprintf(s, sizeof(s), "%s %c", latlon, (gpsdata->fix.longitude < 0) ? 'W' : 'E');
+    } else
+        (void)strcpy(s, "n/a");
+    fprintf(fh,rowhead,"Longitude:",s);
+        
+    if (gpsdata->fix.mode == MODE_3D) {
+        (void)snprintf(s, sizeof(s), "%f metres", gpsdata->fix.altitude);
+    } else
+        (void)strcpy(s, "n/a");
+    fprintf(fh,rowhead,"Altitude:",s);
+
+    if (gpsdata->fix.mode >= MODE_2D && isnan(gpsdata->fix.track)==0) {
+        (void)snprintf(s, sizeof(s), "%f metres/sec", gpsdata->fix.speed);
+    } else
+        (void)strcpy(s, "n/a");
+    fprintf(fh,rowhead,"Speed:",s);
+
+    if (gpsdata->fix.mode >= MODE_2D && isnan(gpsdata->fix.track)==0) {
+        (void)snprintf(s, sizeof(s), "%f degrees", gpsdata->fix.track);
+    } else
+        (void)strcpy(s, "n/a");
+    fprintf(fh,rowhead,"Course:",s);
+
+    if (isnan(gpsdata->fix.eph)==0) {
+        (void)snprintf(s, sizeof(s), "%f metres", gpsdata->fix.eph);
+    } else
+        (void)strcpy(s, "n/a");
+    fprintf(fh,rowhead,"EPH:",s);
+    
+    if (isnan(gpsdata->fix.epv)==0) {
+        (void)snprintf(s, sizeof(s), "%f metres", gpsdata->fix.epv);
+    } else
+        (void)strcpy(s, "n/a");
+    fprintf(fh,rowhead,"EPV:",s);
+    
+    if (gpsdata->fix.mode == MODE_3D && isnan(gpsdata->fix.climb)==0) {
+        (void)snprintf(s, sizeof(s), "%f metres/sec", gpsdata->fix.climb);
+    } else
+        (void)strcpy(s, "n/a");
+    fprintf(fh,rowhead,"Climb:",s);
+    
+    if (gpsdata->online == 0) {
+        newstate = 0;
+        (void)snprintf(s, sizeof(s), "OFFLINE");
+    } else {
+        newstate = gpsdata->fix.mode;
+        switch (gpsdata->fix.mode) {
+            case MODE_2D:
+                (void)snprintf(s, sizeof(s), "2D %sFIX",(gpsdata->status==STATUS_DGPS_FIX)?"DIFF ":"");
+                break;
+            case MODE_3D:
+                (void)snprintf(s, sizeof(s), "3D %sFIX",(gpsdata->status==STATUS_DGPS_FIX)?"DIFF ":"");
+                break;
+            default:
+                (void)snprintf(s, sizeof(s), "NO FIX");
+                break;
+        }
+    }
+    if (newstate != state) {
+        timer = time(NULL);
+        state = newstate;
+    }
+    (void)snprintf(s+strlen(s), sizeof(s)-strlen(s), " (%d secs)", (int) (time(NULL) - timer));
+    fprintf(fh,"\t\t\t<tr>\n\t\t\t\t<td><b>State</b></d><td>%s</td>\n\t\t\t</tr>\n",s);
+    
+    fprintf(fh,"\t\t</table>\n\t</td>\n");
+
+    /* SVG Stuff */
+    fprintf(fh,"\t<td>\n\t\t<embed src=\"gpsd.svg\" width=\"425\" height=\"425\" type=\"image/svg+xml\">\n");
+    
+    //fprintf(fh,"\t<td>\n\t\t<object data=\"gpsd.svg\" width=\"425\" height=\"425\" align=\"center\"\n");
+    //fprintf(fh,"\t\t\ttype=\"image/svg+xml\"\n\t\t\tcodebase=\"http://www.adobe.com/svg/viewer/install/\" />\n\t</td>\n");
+    
+    fprintf(fh,"</table>\n\n</body>\n</html>");
+    
+    
+}
+
+
+void do_svg(FILE *fs){
+    
+    int i, j, x, y, offset;
+    char *fill;
+    
+    const char svghead[] = "<?xml version=\"1.0\" standalone=\"no\"?>\n" \
+    "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\"\n" \
+    "\"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n" \
+    "<svg width=\"100%%\" height=\"100%%\" version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\">\n" \
+    "\t<g transform=\"translate(00,0)\">\n" \
+    "\t\t<circle cx=\"210\" cy=\"210\" r=\"200\" stroke=\"black\"\n" \
+    "\t\tstroke-width=\"1\" fill=\"white\"/>\n" \
+    "\t\t<circle cx=\"210\" cy=\"210\" r=\"100\" stroke=\"grey\"\n" \
+    "\t\tstroke-width=\"1\" fill=\"white\"/>\n" \
+    "\t\t<circle cx=\"210\" cy=\"210\" r=\"2\" stroke=\"grey\"\n" \
+    "\t\tstroke-width=\"1\" fill=\"white\"/>\n" \
+    "\t\t<line x1=\"210\" y1=\"10\" x2=\"210\" y2=\"410\" stroke=\"lightgrey\" />\n" \
+    "\t\t<line x1=\"10\" y1=\"210\" x2=\"410\" y2=\"210\" stroke=\"lightgrey\" />\n" \
+    "\t\t<line x1=\"68.578644\" y1=\"68.578644\" x2=\"351.42136\" y2=\"351.42136\" stroke=\"lightgrey\" />\n" \
+    "\t\t<line x1=\"68.578644\" y1=\"351.42136\" x2=\"351.42136\" y2=\"68.578644\" stroke=\"lightgrey\" />\n" \
+    "\t\t<g font-size=\"10\" stroke=\"black\" stroke-width=\"0.5\">\n" \
+    "\t\t\t<text x=\"206\" y=\"8\">N</text>\n" \
+    "\t\t\t<text x=\"0\" y=\"214\">W</text>\n" \
+    "\t\t\t<text x=\"412\" y=\"214\">E</text>\n" \
+    "\t\t\t<text x=\"206\" y=\"420\">S</text>\n";
+
+    /* Draw the chart axes */
+    fprintf(fs, svghead);
+    
+    /* Draw the skid marks */
+    //printf("Skidin\n");
+    for(i=0;i<SATMAX;i++){
+        if(sattrack[i].PRN != -1){
+            if(sattrack[i].count > 1){
+                fprintf(fs,"\t\t\t<polyline stroke-width=\"0.6\" stroke=\"red\" fill=\"none\" points=\"");
+                for(j=0;j <= sattrack[i].count-1;j++){
+                    x = sattrack[i].posn[j].x;
+                    y = sattrack[i].posn[j].y;
+                    fprintf(fs,"%d,%d ", x, y);
+                }
+                fprintf(fs,"\"/>\n");
+            }
+        }
+    }
+    //printf("Skidout\n");    
+    /* Draw the birdies */
+    if (gpsdata->satellites) {
+        for (i = 0; i < MAXCHANNELS; i++) {
+            if (i < (unsigned int)gpsdata->satellites) {
+
+		polartocart(&x , &y, gpsdata->elevation[i], gpsdata->azimuth[i]);
+                
+                if(gpsdata->ss[i] < 30)
+                    fill = "\"silver\"";
+                else if (gpsdata->ss[i] < 40)
+                    fill = "\"yellow\"";
+                else
+                    fill = "\"lime\"";
+                
+                /* Centre single digits PRNs in the circle */
+                if(gpsdata->PRN[i] < 10)
+                    offset = 3;
+                else
+                    offset = 0;
+                
+                fprintf(fs,"\t\t\t<circle cx=\"%d\" cy=\"%d\" r=\"8\" stroke=\"black\"\n",x,y);
+                fprintf(fs,"\t\t\t\tstroke-width=\"1\" fill=%s/>\n",fill);
+                fprintf(fs,"\t\t\t<text x=\"%d\" y=\"%d\" stroke=\"black\" fill=\"black\" " \
+                           "font-size=\"10\">%d</text>\n",x-6+offset,y+4,gpsdata->PRN[i]);
+            }
+        }
+    }
+    
+
+    fprintf(fs,"\t\t</g>\n");
+    fprintf(fs,"\t</g>\n");
+    fprintf(fs,"</svg>\n");
+}
+
+/* Initialise the track table */
+void init_track_table(void){
+    
+    int i;
+    
+    //printf("ITT\n");
+
+    for (i=0; i<SATMAX; i++){
+        sattrack[i].PRN = -1;
+        sattrack[i].count = 0;
+        sattrack[i].stale = 0;
+    }
+}
+
+/* Make all tracks stale */
+void make_tracks_stale(void){
+    
+    int i;
+    //printf("MTS\n"); 
+    for(i=0; i<SATMAX; i++){
+        if(sattrack[i].stale != 0)
+            sattrack[i].stale--;
+    }
+}
+
+/* Returns the index the PRN is in -  -1 is a fail*/
+int exists_in_table(int prn){
+
+    int i;
+    //printf("EIT\n");
+    for(i=0; i< SATMAX; i++){
+        if (sattrack[i].PRN == prn)
+            return(i);
+    }
+    
+    return -1;
+}
+
+/* Inserts a new sat xy entry into the table */
+void insert_sat(int prn, int x, int y){
+    
+    int i, idx;
+
+    idx = exists_in_table(prn);
+    
+    if (idx == -1){
+        for(i=0; i<SATMAX; i++){
+            if(sattrack[i].PRN == -1){
+                sattrack[i].PRN = prn;
+                sattrack[i].posn[0].x = x;
+                sattrack[i].posn[0].y = y;
+                sattrack[i].count = 1;
+                sattrack[i].stale = STALECOUNT;
+                
+            }
+        }
+    }
+    else{
+        if(sattrack[idx].count < (TRACKMAX-1)){
+            if(sattrack[idx].posn[sattrack[idx].count-1].x != x || \
+                sattrack[idx].posn[sattrack[idx].count-1].y != y){
+                sattrack[idx].posn[sattrack[idx].count].x = x;
+                sattrack[idx].posn[sattrack[idx].count].y = y;
+                sattrack[idx].count++;
+            }
+            sattrack[idx].stale = STALECOUNT;
+        }
+    }
+    //printf("IS %d %d %d\n",idx,prn,sattrack[idx].count);
+
+}
+
+/* Deletes stale sats */
+void delete_stale_sats(void){
+    
+    int i;
+    
+    //printf("DSS\n");
+    
+    for(i=0; i<SATMAX; i++){
+        if (sattrack[i].stale == 0){
+            sattrack[i].PRN = -1;
+            sattrack[i].count = 0;
+        }
+    }
+    //printf("DSSO\n");
+}
+
+void update_track_table(void){
+
+    int i, x, y;
+    
+    //printf("UTT\n");
+   
+    make_tracks_stale();
+    
+    if (gpsdata->satellites) {
+        for (i = 0; i < MAXCHANNELS; i++) {
+            if (i < (unsigned int)gpsdata->satellites) {
+
+		polartocart(&x , &y, gpsdata->elevation[i], gpsdata->azimuth[i]);
+
+                insert_sat(gpsdata->PRN[i],x,y);
+            }
+        }
+    }
+    
+    delete_stale_sats();
+}
+
+int main(int argc, char *argv[])
+{
+
+    FILE *fh,*fs = NULL;
+    char *err_str = NULL;
+    
+    //char server[] = "gpsd.mainframe.cx";
+    //char port[] = "2947";
+    
+    char *server;
+    char *port;
+    char *path;
+    int period;
+    char name1[256], name2[256];
+    
+    //printf("argc %d\n",argc);
+
+    if (argc != 5){
+        fprintf(stderr,"Not enough arguments: <server> <port> <path> <period>\n");
+        exit(2);
+    }
+    
+    server = argv[1];
+    port = argv[2];
+    path = argv[3];
+    period = atoi(argv[4]);
+
+    gpsdata = gps_open(server, port);
+    
+    if (!gpsdata) {
+        switch ( errno ) {
+            case NL_NOSERVICE: 	err_str = "can't get service entry"; break;
+            case NL_NOHOST: 	err_str = "can't get host entry"; break;
+            case NL_NOPROTO: 	err_str = "can't get protocol entry"; break;
+            case NL_NOSOCK: 	err_str = "can't create socket"; break;
+            case NL_NOSOCKOPT: 	err_str = "error SETSOCKOPT SO_REUSEADDR"; break;
+            case NL_NOCONNECT: 	err_str = "can't connect to host"; break;
+            default:             	err_str = "Unknown"; break;
+        }
+        (void)fprintf( stderr, "xgps: no gpsd running or network error: %d, %s\n", errno, err_str);
+        exit(2);
+    }
+    
+    init_track_table();
+    
+    (void)gps_query(gpsdata, "w+x");
+    (void)gps_query(gpsdata, "j=1");
+    
+    
+    for(;;){
+        (void)gps_poll(gpsdata);
+        
+        update_track_table();
+        
+        sprintf(name1,"%s/gpsd.html",path);
+        sprintf(name2,"%s/gpsd.svg",path);
+        
+        if((fh=fopen(name1,"w")) != NULL ){
+            do_html(fh);
+            fclose(fh);
+        }
+        if((fs=fopen(name2,"w")) != NULL ){
+            do_svg(fs);
+            fclose(fs);
+        }
+        sleep(period);
+    }
+    
+    return(0);
+}
